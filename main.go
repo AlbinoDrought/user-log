@@ -60,7 +60,7 @@ func main() {
 		log.Fatalf("failed to migrate: %v", err)
 	}
 
-	stmtAdd, err = db.Prepare("INSERT INTO members(discord_id) VALUES (?)")
+	stmtAdd, err = db.Prepare("INSERT INTO members(discord_id, discord_username, discord_discriminator) VALUES (?, ?, ?)")
 	if err != nil {
 		log.Fatalf("failed to prepare INSERT statement: %v", err)
 	}
