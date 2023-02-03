@@ -1,0 +1,2 @@
+ALTER TABLE members ADD COLUMN discord_username VARCHAR(64) NOT NULL DEFAULT '';
+ALTER TABLE members ADD COLUMN discord_discriminator VARCHAR(16) NOT NULL DEFAULT '';

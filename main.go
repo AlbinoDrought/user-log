@@ -2,10 +2,14 @@ package main
 
 import (
 	"database/sql"
+	"embed"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -19,12 +23,17 @@ var (
 	guildID, channelID string
 
 	knownMemberStateLock  sync.RWMutex
-	knownMemberState      map[string]interface{}
+	knownMemberState      map[string]discordUser
 	knownMemberStateEmpty bool
 
-	db                  *sql.DB
-	stmtAdd, stmtRemove *sql.Stmt
+	db                              *sql.DB
+	stmtAdd, stmtUpdate, stmtRemove *sql.Stmt
 )
+
+type discordUser struct {
+	username      string
+	discriminator string
+}
 
 func main() {
 	var err error
@@ -47,14 +56,18 @@ func main() {
 	}
 	defer db.Close()
 
-	_, err = db.Exec("CREATE TABLE IF NOT EXISTS members (id INTEGER NOT NULL PRIMARY KEY, discord_id VARCHAR(20) NOT NULL UNIQUE);")
-	if err != nil {
-		log.Fatalf("failed to create table: %v", err)
+	if err := migrate(db); err != nil {
+		log.Fatalf("failed to migrate: %v", err)
 	}
 
 	stmtAdd, err = db.Prepare("INSERT INTO members(discord_id) VALUES (?)")
 	if err != nil {
 		log.Fatalf("failed to prepare INSERT statement: %v", err)
+	}
+
+	stmtUpdate, err = db.Prepare("UPDATE members SET discord_username = ?, discord_discriminator = ? WHERE discord_id = ?")
+	if err != nil {
+		log.Fatalf("failed to prepare UPDATE statement: %v", err)
 	}
 
 	stmtRemove, err = db.Prepare("DELETE FROM members WHERE discord_id = ?")
@@ -63,7 +76,7 @@ func main() {
 	}
 
 	// load members from persistent storage
-	knownMemberState = map[string]interface{}{}
+	knownMemberState = map[string]discordUser{}
 	{
 		rows, err := db.Query("SELECT discord_id FROM members")
 		if err != nil {
@@ -72,11 +85,11 @@ func main() {
 
 		var discordID string
 		for rows.Next() {
-			if err = rows.Scan(&discordID); err != nil {
+			discordUser := discordUser{}
+			if err = rows.Scan(&discordID, &discordUser.username, &discordUser.discriminator); err != nil {
 				log.Fatalf("failed scanning discord ID from row: %v", err)
 			}
-
-			knownMemberState[discordID] = nil
+			knownMemberState[discordID] = discordUser
 		}
 
 		rows.Close()
@@ -123,6 +136,76 @@ func main() {
 	log.Println("I'm closing 😢")
 }
 
+//go:embed migrations
+var migrations embed.FS
+
+func migrate(db *sql.DB) error {
+	_, err := db.Exec("CREATE TABLE IF NOT EXISTS migrations (id INTEGER NOT NULL PRIMARY KEY, name TEXT UNIQUE);")
+	if err != nil {
+		return err
+	}
+
+	stmtCheck, err := db.Prepare("SELECT 1 FROM migrations WHERE name = ?")
+	if err != nil {
+		return err
+	}
+	defer stmtCheck.Close()
+
+	stmtStore, err := db.Prepare("INSERT INTO migrations(name) VALUES (?)")
+	if err != nil {
+		return err
+	}
+	defer stmtStore.Close()
+
+	migrationDirEntries, err := migrations.ReadDir("migrations")
+	if err != nil {
+		return err
+	}
+
+	migrationFiles := []string{}
+	for _, migrationDirEntry := range migrationDirEntries {
+		if migrationDirEntry.IsDir() {
+			continue
+		}
+		migrationFiles = append(migrationFiles, migrationDirEntry.Name())
+	}
+
+	sort.Slice(migrationFiles, func(i, j int) bool {
+		return strings.Compare(migrationFiles[i], migrationFiles[j]) <= 0
+	})
+
+	for _, migrationFile := range migrationFiles {
+		result := stmtCheck.QueryRow(migrationFile)
+		err := result.Scan()
+		if err == nil {
+			// already migrated
+			continue
+		}
+		if err != sql.ErrNoRows {
+			// other unknown error
+			return err
+		}
+
+		migrationSql, err := migrations.ReadFile(path.Join("migrations", migrationFile))
+		if err != nil {
+			return err
+		}
+
+		log.Printf("[migration] RUN %v", migrationFile)
+		_, err = db.Exec(string(migrationSql))
+		if err != nil {
+			return err
+		}
+		_, err = stmtStore.Exec(migrationFile)
+		if err != nil {
+			return err
+		}
+		log.Printf("[migration] FIN %v", migrationFile)
+	}
+
+	return nil
+}
+
 func ready(s *discordgo.Session, event *discordgo.Ready) {
 	s.UpdateGameStatus(0, "hello")
 }
@@ -132,7 +215,11 @@ func guildMemberAdd(s *discordgo.Session, m *discordgo.GuildMemberAdd) {
 		return
 	}
 	// log.Printf("received member added event: %v", m.User.ID)
-	memberAdded(s, m.User.ID)
+	// memberAdded(s, m.User.ID, m.User.Username, m.User.Discriminator)
+	memberAdded(s, m.User.ID, discordUser{
+		username:      m.User.Username,
+		discriminator: m.User.Discriminator,
+	})
 }
 
 func guildMemberRemove(s *discordgo.Session, m *discordgo.GuildMemberRemove) {
@@ -143,29 +230,41 @@ func guildMemberRemove(s *discordgo.Session, m *discordgo.GuildMemberRemove) {
 	memberRemoved(s, m.User.ID)
 }
 
-func memberAdded(s *discordgo.Session, discordID string) {
+func memberAdded(s *discordgo.Session, discordID string, user discordUser) {
 	knownMemberStateLock.Lock()
 	defer knownMemberStateLock.Unlock()
-	memberAddedLocked(s, discordID)
+	memberAddedLocked(s, discordID, user)
 }
 
-func memberAddedLocked(s *discordgo.Session, discordID string) {
+func memberAddedLocked(s *discordgo.Session, discordID string, user discordUser) {
 	_, exists := knownMemberState[discordID]
 	if exists {
 		return
 	}
-	_, err := stmtAdd.Exec(discordID)
+	_, err := stmtAdd.Exec(discordID, user.username, user.discriminator)
 	if err != nil {
 		log.Fatalf("failed to insert member '%v' to persistent storage: %v", err, discordID)
 	}
-	knownMemberState[discordID] = nil
+	knownMemberState[discordID] = user
 	if !knownMemberStateEmpty {
-		_, err = s.ChannelMessageSend(channelID, fmt.Sprintf("<@%v> joined the server", discordID))
+		if user.username == "" && user.discriminator == "" {
+			_, err = s.ChannelMessageSend(channelID, fmt.Sprintf("<@%v> joined the server", discordID))
+		} else {
+			_, err = s.ChannelMessageSend(channelID, fmt.Sprintf("<@%v> (%v#%v) joined the server", discordID, user.username, user.discriminator))
+		}
 		if err != nil {
 			log.Fatalf("failed to send message about '%v' joining server: %v", discordID, err)
 		}
 		log.Printf("messaged about '%v' joining", discordID)
 	}
+}
+
+func memberUpdatedLocked(s *discordgo.Session, discordID string, user discordUser) {
+	_, err := stmtUpdate.Exec(discordID, user.username, user.discriminator)
+	if err != nil {
+		log.Fatalf("failed to update member '%v' in persistent storage: %v", err, discordID)
+	}
+	knownMemberState[discordID] = user
 }
 
 func memberRemoved(s *discordgo.Session, discordID string) {
@@ -175,7 +274,7 @@ func memberRemoved(s *discordgo.Session, discordID string) {
 }
 
 func memberRemovedLocked(s *discordgo.Session, discordID string) {
-	_, exists := knownMemberState[discordID]
+	user, exists := knownMemberState[discordID]
 	if !exists {
 		return
 	}
@@ -185,7 +284,11 @@ func memberRemovedLocked(s *discordgo.Session, discordID string) {
 	}
 	delete(knownMemberState, discordID)
 	if !knownMemberStateEmpty {
-		_, err = s.ChannelMessageSend(channelID, fmt.Sprintf("<@%v> left the server", discordID))
+		if user.username == "" && user.discriminator == "" {
+			_, err = s.ChannelMessageSend(channelID, fmt.Sprintf("<@%v> left the server", discordID))
+		} else {
+			_, err = s.ChannelMessageSend(channelID, fmt.Sprintf("<@%v> (%v#%v) left the server", discordID, user.username, user.discriminator))
+		}
 		if err != nil {
 			log.Fatalf("failed to send message about '%v' leaving server: %v", discordID, err)
 		}
@@ -220,9 +323,17 @@ func syncMembersFromServer(s *discordgo.Session) {
 			if member.User == nil {
 				continue
 			}
-			_, exists := knownMemberStateClone[member.User.ID]
-			if !exists {
-				memberAddedLocked(s, member.User.ID)
+			memberUser := discordUser{
+				username:      member.User.Username,
+				discriminator: member.User.Discriminator,
+			}
+			user, exists := knownMemberState[member.User.ID]
+			if exists {
+				if user.username != memberUser.username || user.discriminator != memberUser.discriminator {
+					memberUpdatedLocked(s, member.User.ID, memberUser)
+				}
+			} else {
+				memberAddedLocked(s, member.User.ID, memberUser)
 			}
 			delete(knownMemberStateClone, member.User.ID)
 		}
