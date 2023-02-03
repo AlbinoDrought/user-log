@@ -78,7 +78,7 @@ func main() {
 	// load members from persistent storage
 	knownMemberState = map[string]discordUser{}
 	{
-		rows, err := db.Query("SELECT discord_id FROM members")
+		rows, err := db.Query("SELECT discord_id, discord_username, discord_discriminator FROM members")
 		if err != nil {
 			log.Fatalf("failed to query members: %v", err)
 		}
@@ -176,7 +176,8 @@ func migrate(db *sql.DB) error {
 
 	for _, migrationFile := range migrationFiles {
 		result := stmtCheck.QueryRow(migrationFile)
-		err := result.Scan()
+		var i int
+		err := result.Scan(&i)
 		if err == nil {
 			// already migrated
 			continue
