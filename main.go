@@ -261,7 +261,7 @@ func memberAddedLocked(s *discordgo.Session, discordID string, user discordUser)
 }
 
 func memberUpdatedLocked(s *discordgo.Session, discordID string, user discordUser) {
-	_, err := stmtUpdate.Exec(discordID, user.username, user.discriminator)
+	_, err := stmtUpdate.Exec(user.username, user.discriminator, discordID)
 	if err != nil {
 		log.Fatalf("failed to update member '%v' in persistent storage: %v", err, discordID)
 	}
