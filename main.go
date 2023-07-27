@@ -250,6 +250,9 @@ func memberAddedLocked(s *discordgo.Session, discordID string, user discordUser)
 	if !knownMemberStateEmpty {
 		if user.username == "" && user.discriminator == "" {
 			_, err = s.ChannelMessageSend(channelID, fmt.Sprintf("<@%v> joined the server", discordID))
+		} else if user.discriminator == "0" {
+			// discriminator of "0" == new discord username format, numberless
+			_, err = s.ChannelMessageSend(channelID, fmt.Sprintf("<@%v> (%v) joined the server", discordID, user.username))
 		} else {
 			_, err = s.ChannelMessageSend(channelID, fmt.Sprintf("<@%v> (%v#%v) joined the server", discordID, user.username, user.discriminator))
 		}
@@ -287,6 +290,9 @@ func memberRemovedLocked(s *discordgo.Session, discordID string) {
 	if !knownMemberStateEmpty {
 		if user.username == "" && user.discriminator == "" {
 			_, err = s.ChannelMessageSend(channelID, fmt.Sprintf("<@%v> left the server", discordID))
+		} else if user.discriminator == "0" {
+			// discriminator of "0" == new discord username format, numberless
+			_, err = s.ChannelMessageSend(channelID, fmt.Sprintf("<@%v> (%v) left the server", discordID, user.username))
 		} else {
 			_, err = s.ChannelMessageSend(channelID, fmt.Sprintf("<@%v> (%v#%v) left the server", discordID, user.username, user.discriminator))
 		}
